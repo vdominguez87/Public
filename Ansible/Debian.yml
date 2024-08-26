@@ -1,0 +1,160 @@
+- hosts: "{{ api_token_host }}"
+  gather_facts: no
+
+  vars:
+
+    api_token_user: !vault |
+          $ANSIBLE_VAULT;1.1;AES256         		  	
+          ********************************************************************************
+          ********************************************************************************
+          ********************************************************************************
+          ********************************************************************************
+          ****
+
+    api_token_host: !vault |
+          $ANSIBLE_VAULT;1.1;AES256
+          ********************************************************************************
+          ********************************************************************************
+          ********************************************************************************
+          ********************************************************************************
+          ****
+
+    api_token_id: !vault |
+          $ANSIBLE_VAULT;1.1;AES256
+          ********************************************************************************
+          ********************************************************************************
+          ********************************************************************************
+          ********************************************************************************
+          ****
+
+    api_token_secret: !vault |
+          $ANSIBLE_VAULT;1.1;AES256
+          ********************************************************************************
+          ********************************************************************************
+          ********************************************************************************
+          ********************************************************************************
+          ****************************************************
+
+    node: !vault |
+          $ANSIBLE_VAULT;1.1;AES256
+          ********************************************************************************
+          ********************************************************************************
+          ********************************************************************************
+          ********************************************************************************
+          ****
+
+  tasks:
+    - name: Fetch current VM IDs
+      shell: >
+        qm list | awk '{print $1}' | grep -E '^[0-9]+$' | sort -n
+      register: current_vmid_list
+      ignore_errors: yes
+
+    - name: Determine next available VM ID
+      set_fact:
+        next_vmid: "{{ current_vmid_list.stdout_lines | map('int') | max + 1 }}"
+      when: current_vmid_list.stdout_lines | length > 0
+
+    - name: Read contents of preseed.cfg into a variable
+      ansible.builtin.shell:
+        cmd: "cat /Ansible/preseed.cfg"
+      register: preseed_content
+      delegate_to: localhost
+
+    - name: Assign command output to variable
+      set_fact:
+        preseed: "{{ preseed_content.stdout }}"
+
+    - name: Query Debian repository for latest stable release
+      uri:
+        url: "https://www.debian.org/distrib/netinst"
+        return_content: yes
+      register: debian_release_page
+
+    - name: Parse and filter latest amd64 netinst ISO link
+      set_fact:
+        debian_latest_url: "{{ debian_release_page.content | regex_search('https?://[^\\s\"]*amd64[^\\s\"]*netinst[^\\s\"]*\\.iso') }}"
+
+    - name: Extract File name from URL
+      set_fact:
+        debian_latest_version: "{{ debian_latest_url | regex_replace('.*/([^/]+\\.iso)', '\\1') }}"
+
+    - name: Download Latest Debian ISO
+      shell: |
+        wget -O /var/lib/vz/template/iso/"{{ debian_latest_version }}" "{{ debian_latest_url }}"
+      args:
+        executable: /bin/bash
+
+    - name: Extract Debian
+      shell: |
+        xorriso -osirrox on -indev /var/lib/vz/template/iso/"{{ debian_latest_version }}" -extract / /var/lib/vz/template/iso/Extracted
+      args:
+        executable: /bin/bash
+
+    - name: Inject preseed.cfg to Extracted
+      shell: |
+        echo "{{ preseed_content.stdout }}" > /var/lib/vz/template/iso/Extracted/preseed.cfg
+      args:
+        executable: /bin/bash
+
+    - name: Inject boot parameters into isolinux.cfg
+      shell: |
+        cat << EOF > /var/lib/vz/template/iso/Extracted/isolinux/isolinux.cfg
+        # D-I config version 2.0
+        # search path for the c32 support libraries (libcom32, libutil etc.)
+        path
+        prompt 0
+        timeout 0
+        include menu.cfg
+        default preseed
+
+        label preseed
+          menu label ^Install Debian
+          kernel /install.amd/vmlinuz
+          append vga=788 initrd=/install.amd/gtk/initrd.gz auto=true priority=critical file=/cdrom/preseed.cfg --
+        EOF
+
+    - name: Remove old Debian and replace with Custom
+      shell: |
+        rm /var/lib/vz/template/iso/"{{ debian_latest_version }}"
+        genisoimage -o /var/lib/vz/template/iso/"{{ debian_latest_version }}" -r -J -no-emul-boot -boot-load-size 4 -boot-info-table -b isolinux/isolinux.bin -c isolinux/boot.cat /var/lib/vz/template/iso/Extracted
+       # rm -R /var/lib/vz/template/iso/Extracted
+      args:
+        executable: /bin/bash
+
+    - name: Create LV
+      ansible.builtin.command: >
+        lvcreate -L 16G -n vm-"{{ next_vmid | regex_replace('[^0-9]', '') }}"-disk-0 pve
+      become: true
+
+    - name: Create VM
+      proxmox_kvm:
+        api_host: "{{ api_token_host }}"
+        api_user: "{{ api_token_user }}"
+        api_token_id: "{{ api_token_id }}"
+        api_token_secret: "{{ api_token_secret }}"
+        node: "{{ node }}"
+        vmid: "{{ next_vmid }}"
+        name: Debian
+        ostype: l26
+        memory: 2048
+        cores: 2
+        sockets: 1
+        scsihw: virtio-scsi-single
+        net:
+           net0: virtio,bridge=vmbr0,firewall=1
+        ide:
+           ide2: local:iso/{{ debian_latest_version }},media=cdrom
+        scsi:
+           scsi0: local-lvm:vm-{{ next_vmid | replace('-', '') }}-disk-0,iothread=1,size=4G
+        state: present
+
+    - name: Start VM
+      proxmox_kvm:
+        api_host: "{{ api_token_host }}"
+        api_user: "{{ api_token_user }}"
+        api_token_id: "{{ api_token_id }}"
+        api_token_secret: "{{ api_token_secret }}"
+        node: "{{ node }}"
+        vmid: "{{ next_vmid }}"
+        state: started
